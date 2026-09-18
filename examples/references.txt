@@ -1,0 +1,6 @@
+# One reference per line. Anything after a # is ignored.
+10000000
+US 9,876,543 B2
+2015/0123456
+EP1234567A1
+Jones, "A Survey of Widget Fasteners," J. Widgets 12(3) 2019
