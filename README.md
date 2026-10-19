@@ -20,7 +20,7 @@ could not find.*
 
 ![The document it writes: the header block and the four tables, numbered straight through](docs/output.jpg)
 
-*The Word document it saves. Open it, check it, add your signature, file it.*
+*The Word document it saves. Open it, check it, sign it, file it. It ends with a signature block (signature, name, registration number) dated the day it was made.*
 
 > **Not legal advice, and not a substitute for reading the references.** This is a
 > typing tool. Check every line against the document itself before you file anything,
@@ -72,10 +72,38 @@ anything it could not look up so you can fill those in yourself.
 | `--csv FILE` | Also write what was found as a spreadsheet |
 | `--applicant`, `--app-no`, `--filed`, `--title`, `--docket` | Fill in the header block |
 | `--examiner`, `--art-unit` | Default to `N/A`, which is right for an application that has not been examined |
-| `--attorney` | Name under the signature line |
+| `--attorney` | Name in the signature block |
+| `--reg-no` | USPTO registration number in the signature block (left as a line to fill in when not given) |
 | `--no-lookup` | Stay offline and list the numbers exactly as given |
+| `--source auto\|google\|odp` | Where to look numbers up. `odp` is the USPTO's own Open Data Portal (needs a free key: `--odp-key` or `$USPTO_ODP_KEY`). `auto` uses it when a key is set, Google Patents otherwise |
+| `--old-db FILE` | An offline index of pre-2001 US patents from `build_old_db.py`, consulted when the portal or Google has nothing (default `$SIENNA_OLD_DB`) |
+| `--no-google` | With `--source odp`, do not try Google Patents for what the portal lacks |
 
-**Where the data comes from.** Each patent's own published record on Google Patents,
+**Where the data comes from.** By default, Google Patents. Google refuses requests from
+many servers and shared hosts (a "Sorry..." 503 page); if you see `lookup failed
+(HTTPError)` on every line, get a free API key from the USPTO Open Data Portal
+(https://data.uspto.gov/apis/getting-started) and run with `--source odp`. That reads
+the Patent Office's primary record (filing date, grant or publication date, first named
+inventor) and backs off politely when the portal throttles a burst; it covers US patents
+and publications only, so foreign documents are left for you to complete.
+
+**Patents from before 2001.** The portal only knows applications filed on or after
+1 January 2001, so a 1990s patent comes back "nothing found" there and, on a server
+Google refuses, would stay blank. `build_old_db.py` fixes that: it turns PatentsView's
+bulk grant data (1976 on, rehosted by the USPTO as product PVGPATDIS) into a SQLite
+index of every grant the portal lacks, about 2.5 million rows in a couple of hundred
+megabytes, and `--old-db` (or `$SIENNA_OLD_DB`) makes the generator consult it whenever
+the portal or Google has nothing:
+
+    python3 build_old_db.py --odp-key $USPTO_ODP_KEY --out old_patents.sqlite
+    ids-gen --source odp --old-db old_patents.sqlite 5368281 5518486
+
+The download is three zips of about a gigabyte in all; the portal allows twenty
+downloads of each per year, so keep them. The order of lookups is: the portal, then the
+index, then Google Patents (skip that last step with `--no-google` on a host Google
+blocks). With `--source google` it is Google, then the index.
+
+With Google Patents: each patent's own published record on Google Patents,
 read from the page's metadata: filing date (`DC.date scheme=dateSubmitted`), issue or
 publication date, and the first named inventor. A granted patent carries its issue date
 with `scheme="issue"`; a publication has a plain `DC.date` instead, and the program

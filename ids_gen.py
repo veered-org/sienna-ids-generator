@@ -14,16 +14,17 @@ the reference itself before it goes to the Patent Office.
     ids-gen --from-folder "Prior Art" --applicant "Smith" --app-no 19/801,543
 """
 
-import argparse, csv, os, re, sys, time, urllib.parse, urllib.request
+import argparse, csv, datetime, os, re, sys, time, urllib.error, urllib.parse, urllib.request
 
 UA = "Mozilla/5.0 (ids-gen; +https://veered.org/ids-generator/)"
 GP = "https://patents.google.com/patent/%s/en"
+ODP = "https://api.uspto.gov/api/v1/patent/applications/search"
 
 # --------------------------------------------------------------------------- #
 #  Reading the numbers                                                         #
 # --------------------------------------------------------------------------- #
 
-US_PUB = re.compile(r"^(?:US)?\s*(20\d{2})[/\-]?(\d{6,7})\s*([A-Z]\d?)?$", re.I)
+US_PUB = re.compile(r"^(?:US)?\s*(20\d{2})[/\-\s]?(\d{6,7})\s*([A-Z]\d?)?$", re.I)
 US_PAT = re.compile(r"^(?:US)?\s*([0-9]{1,2},?[0-9]{3},?[0-9]{3})\s*([A-Z]\d?)?$", re.I)
 FOREIGN = re.compile(r"^([A-Z]{2})\s*([0-9][0-9 ,/\-]*)\s*([A-Z]\d?)?$", re.I)
 
@@ -100,7 +101,8 @@ def refs_from_folder(folder):
         stem = os.path.splitext(name)[0]
         stem = re.sub(r"[_\-]+", " ", stem)
         m = re.search(r"((?:US|EP|WO|GB|DE|FR|JP|CN|KR|CA|IL)?\s*"
-                      r"(?:20\d{2}[/\-]?\d{6,7}|[0-9]{1,2},?[0-9]{3},?[0-9]{3})\s*[A-Z]?\d?)", stem, re.I)
+                      r"(?:20\d{2}[/\-\s]?\d{6,7}|[0-9]{1,2},?[0-9]{3},?[0-9]{3})"
+                      r"(?:\s*[A-Z]\d?(?![A-Za-z]))?)", stem, re.I)     # a kind code is a lone letter, not the "s" of "see"
         out.append(Ref(m.group(1) if m else stem))
     return out
 
@@ -144,6 +146,116 @@ def fetch(ref, pause=0.6):
     return ref
 
 
+def fetch_odp(ref, key, pause=0.25):
+    """Fill in the dates and the inventor from the USPTO's own Open Data Portal.
+
+    Google Patents refuses many servers (data centres, shared hosts), and the
+    USPTO's data is the primary record anyway. Needs a free API key from
+    https://data.uspto.gov/apis/getting-started (pass --odp-key or set
+    USPTO_ODP_KEY). Covers US patents and US publications; foreign documents
+    and literature are left for you to complete by hand."""
+    import json
+    if ref.table == "us_patent":
+        q = "applicationMetaData.patentNumber:%s" % ref.number
+    elif ref.table == "us_pub":
+        q = "applicationMetaData.earliestPublicationNumber:*%s*" % ref.number.replace("/", "")
+    else:
+        ref.note = ("not looked up (USPTO data covers US documents only)"
+                    if ref.table == "foreign" else "not looked up (not a patent number)")
+        return ref
+    url = ODP + "?" + urllib.parse.urlencode(
+        {"q": q, "fields": "applicationMetaData", "limit": 1})
+    body, code = "", 0
+    for attempt in range(4):                                # the portal throttles bursts: back off on 429
+        try:
+            req = urllib.request.Request(url, headers={"X-API-KEY": key, "User-Agent": UA,
+                                                       "Accept": "application/json"})
+            body = urllib.request.urlopen(req, timeout=25).read().decode("utf-8", "replace")
+            code = 200
+        except urllib.error.HTTPError as e:
+            body, code = "", e.code
+        except Exception as e:                              # offline, timeout
+            ref.note = "lookup failed (%s)" % e.__class__.__name__
+            return ref
+        if code not in (429, 502, 503):
+            break
+        time.sleep(1.5 * (attempt + 1))
+    time.sleep(pause)
+    if code == 404:
+        ref.note = "nothing found -- check the number"
+        return ref
+    if code != 200:
+        ref.note = "lookup failed (HTTP %s)" % code
+        return ref
+    try:
+        bag = json.loads(body).get("patentFileWrapperDataBag") or []
+        m = bag[0]["applicationMetaData"]
+    except Exception:
+        ref.note = "nothing found -- check the number"
+        return ref
+    ref.filed = m.get("filingDate", "") or ""
+    if ref.table == "us_patent":
+        ref.dated = m.get("grantDate", "") or ""
+    else:
+        ref.dated = m.get("earliestPublicationDate", "") or ""
+    ref.inventor = m.get("firstInventorName", "") or ""
+    ref.title = re.sub(r"\s+", " ", m.get("inventionTitle", "") or "").strip()
+    if not (ref.filed or ref.dated):
+        ref.note = "nothing found -- check the number"
+    return ref
+
+
+def fetch_local(ref, db_path):
+    """Fill in a US patent from the offline index built by build_old_db.py.
+
+    The Open Data Portal starts with applications filed in 2001, so a 1990s
+    patent comes back "not found" there. The index holds every grant from 1976
+    that the portal lacks (number, filing date, issue date, first inventor,
+    title), read from PatentsView's bulk data."""
+    import sqlite3
+    if ref.table != "us_patent":
+        return ref
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % urllib.parse.quote(db_path), uri=True)
+        row = con.execute("SELECT filed, dated, inventor, title FROM patents WHERE number = ?",
+                          (ref.number,)).fetchone()
+        con.close()
+    except sqlite3.Error as e:
+        ref.note = "lookup failed (local index: %s)" % e
+        return ref
+    if not row:
+        return ref
+    ref.filed, ref.dated, ref.inventor, ref.title = [x or "" for x in row]
+    ref.note = "" if (ref.filed or ref.dated) else ref.note
+    return ref
+
+
+def lookup(ref, source, odp_key="", old_db="", google=True):
+    """Try the sources in turn until one has the reference.
+
+    odp:    the portal, then the local index (for pre-2001 patents), then
+            Google Patents unless google=False.
+    google: Google Patents, then the local index."""
+    order = ["odp", "local", "google"] if source == "odp" else ["google", "local"]
+    for src in order:
+        if src == "local" and not old_db:
+            continue
+        if src == "google" and not google:
+            continue
+        if src == "odp":
+            fetch_odp(ref, odp_key)
+        elif src == "local":
+            fetch_local(ref, old_db)
+        else:
+            note = ref.note
+            fetch(ref)
+            if ref.note and note:            # keep the more telling of two failures
+                ref.note = note if note.startswith("nothing found") else ref.note
+        if ref.filed or ref.dated or ref.note.startswith("not looked up"):
+            return ref
+    return ref
+
+
 # --------------------------------------------------------------------------- #
 #  Writing the document                                                        #
 # --------------------------------------------------------------------------- #
@@ -157,9 +269,46 @@ HEAD = [("us_patent", "U.S. PATENTS",
         ("npl", "NON-PATENT LITERATURE DOCUMENTS",
          ["Cite No.", "Document"])]
 
+# Column widths in inches (6.5" of text width). "Cite No." and "Kind Code" are just wide
+# enough for their headings; the number and name columns take the rest.
+WIDTHS = {"us_patent": [0.8, 1.9, 0.95, 1.0, 1.85],
+          "us_pub":    [0.8, 1.9, 0.95, 1.0, 1.85],
+          "foreign":   [0.8, 0.8, 1.4, 0.95, 1.0, 1.55],
+          "npl":       [0.8, 5.7]}
+
+
+def _set_widths(table, widths):
+    from docx.shared import Inches
+    table.autofit = False
+    for col, w in zip(table.columns, widths):      # the grid (what LibreOffice reads)
+        col.width = Inches(w)
+    for row in table.rows:                         # the cells (what Word reads)
+        for cell, w in zip(row.cells, widths):
+            cell.width = Inches(w)
+
+
+def signature_date(today=None):
+    """Today's date as it goes under the signature: October 19, 2026."""
+    d = today or datetime.date.today()
+    return "%s %d, %d" % (d.strftime("%B"), d.day, d.year)
+
+
+def _underline_cell(cell):
+    """A bottom border on one table cell: the line the signature goes on."""
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    tcPr = cell._tc.get_or_add_tcPr()
+    borders = OxmlElement("w:tcBorders")
+    bottom = OxmlElement("w:bottom")
+    for k, v in (("w:val", "single"), ("w:sz", "6"), ("w:space", "0"), ("w:color", "000000")):
+        bottom.set(qn(k), v)
+    borders.append(bottom)
+    tcPr.append(borders)
+
 
 def write_docx(refs, path, applicant="", app_no="", filed="", title="",
-               examiner="N/A", art_unit="N/A", attorney="", docket=""):
+               examiner="N/A", art_unit="N/A", attorney="", docket="", reg_no="",
+               today=None):
     from docx import Document
     from docx.shared import Pt, Inches
     from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -171,6 +320,20 @@ def write_docx(refs, path, applicant="", app_no="", filed="", title="",
         s.top_margin = s.bottom_margin = Inches(1)
     style = doc.styles["Normal"]
     style.font.name, style.font.size = "Lexend", Pt(10)
+
+    from docx.shared import RGBColor
+    notice = doc.add_table(rows=1, cols=1)
+    notice.style = "Table Grid"
+    _set_widths(notice, [6.5])
+    np_ = notice.rows[0].cells[0].paragraphs[0]
+    nr = np_.add_run(
+        "Generated on the website of Feigin and Fridman at https://PatentLawNY.com/patent-tools "
+        "based on software programmed by AI - no warranty given - this document must be reviewed "
+        "by a competent licensed Patent Attorney / Agent before submitting same to the "
+        "U.S. Patent Office.")
+    nr.font.color.rgb = RGBColor(0xC0, 0x00, 0x00)
+    nr.bold = True
+    doc.add_paragraph()
 
     h = doc.add_paragraph()
     h.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -215,6 +378,7 @@ def write_docx(refs, path, applicant="", app_no="", filed="", title="",
                 vals = [str(n), ref.display_number(), ref.kind, ref.dated, ref.inventor]
             for i, v in enumerate(vals):
                 cells[i].text = v or ""
+        _set_widths(t, WIDTHS[key])
         doc.add_paragraph()
 
     doc.add_paragraph(
@@ -222,9 +386,25 @@ def write_docx(refs, path, applicant="", app_no="", filed="", title="",
         "consideration. No representation is made that a search has been conducted "
         "or that the information cited is material to patentability.")
     doc.add_paragraph()
-    sign = doc.add_paragraph()
-    sign.add_run("Respectfully submitted,\n\n\n")
-    sign.add_run((attorney or "________________________") + "\n")
+    doc.add_paragraph("Respectfully submitted,")
+    # The practitioner's signature block: signature, name and registration number
+    # are left as lines to fill in (unless given); the date is the day it was made.
+    from docx.enum.table import WD_ALIGN_VERTICAL
+    block = doc.add_table(rows=0, cols=2)
+    for label, value in (("Signature", ""), ("Name", attorney),
+                         ("Registration No.", reg_no),
+                         ("Date", signature_date(today))):
+        row = block.add_row().cells
+        row[0].text, row[1].text = label + ":", value
+        row[0].paragraphs[0].runs[0].bold = True
+        for c in row:
+            c.vertical_alignment = WD_ALIGN_VERTICAL.BOTTOM
+            c.paragraphs[0].paragraph_format.space_after = Pt(0)
+            c.paragraphs[0].paragraph_format.space_before = Pt(8)
+        if not value:   # a line to fill in by hand
+            _underline_cell(row[1])
+            block.rows[-1].height = Inches(0.5 if label == "Signature" else 0.35)
+    _set_widths(block, [1.6, 3.4])
     doc.save(path)
     return n
 
@@ -253,8 +433,20 @@ def main(argv=None):
     ap.add_argument("--filed", default="", help="filing date of YOUR application")
     ap.add_argument("--title", default=""), ap.add_argument("--docket", default="")
     ap.add_argument("--examiner", default="N/A"), ap.add_argument("--art-unit", default="N/A")
-    ap.add_argument("--attorney", default="")
+    ap.add_argument("--attorney", default="", help="name in the signature block")
+    ap.add_argument("--reg-no", default="", help="USPTO registration number in the signature block "
+                    "(left as a line to fill in when not given)")
     ap.add_argument("--no-lookup", action="store_true", help="do not go online; list the numbers as given")
+    ap.add_argument("--source", choices=("auto", "google", "odp"), default="auto",
+                    help="where to look the numbers up: Google Patents, the USPTO Open Data "
+                         "Portal (needs a key), or auto = ODP when a key is set, else Google")
+    ap.add_argument("--odp-key", default=os.environ.get("USPTO_ODP_KEY", ""),
+                    help="USPTO Open Data Portal API key (default: $USPTO_ODP_KEY)")
+    ap.add_argument("--old-db", metavar="FILE", default=os.environ.get("SIENNA_OLD_DB", ""),
+                    help="offline index of pre-2001 US patents from build_old_db.py, used when the "
+                         "portal or Google has nothing (default: $SIENNA_OLD_DB)")
+    ap.add_argument("--no-google", action="store_true",
+                    help="with --source odp, do not fall back to Google Patents for what the portal lacks")
     a = ap.parse_args(argv)
 
     refs = [Ref(x) for x in a.numbers]
@@ -273,14 +465,21 @@ def main(argv=None):
         seen.add(k)
         unique.append(r)
 
+    source = a.source
+    if source == "auto":
+        source = "odp" if a.odp_key else "google"
+    if source == "odp" and not a.odp_key:
+        ap.error("--source odp needs --odp-key or $USPTO_ODP_KEY")
+    if a.old_db and not os.path.exists(a.old_db):
+        ap.error("--old-db: no such file: %s" % a.old_db)
     for r in unique:
         if not a.no_lookup:
-            fetch(r)
+            lookup(r, source, a.odp_key, a.old_db, google=not a.no_google)
         line = "  %-22s %-10s %-12s %s" % (r.display_number(), r.kind, r.dated or "-", r.inventor or "")
         print(line + (("   [" + r.note + "]") if r.note else ""))
 
     n = write_docx(unique, a.out, a.applicant, a.app_no, a.filed, a.title,
-                   a.examiner, a.art_unit, a.attorney, a.docket)
+                   a.examiner, a.art_unit, a.attorney, a.docket, a.reg_no)
     print("\n%d reference(s) -> %s" % (n, a.out))
     if a.csv:
         write_csv(unique, a.csv)
