@@ -28,6 +28,13 @@ US_PUB = re.compile(r"^(?:US)?\s*(20\d{2})[/\-\s]?(\d{6,7})\s*([A-Z]\d?)?$", re.
 US_PAT = re.compile(r"^(?:US)?\s*([0-9]{1,2},?[0-9]{3},?[0-9]{3})\s*([A-Z]\d?)?$", re.I)
 FOREIGN = re.compile(r"^([A-Z]{2})\s*([0-9][0-9 ,/\-]*)\s*([A-Z]\d?)?$", re.I)
 
+# The T column (a checked box = an English-language translation is provided), as on
+# the SB-1449 and, from November 5, 2026, the PTO-892. It starts checked for a foreign
+# document unless the office publishes in English, or may have (EP and WO: read the
+# reference, then check the box yourself).
+ENGLISH_OFFICES = {"AU", "CA", "GB", "IE", "IN", "NZ", "SG", "ZA"}
+EITHER_LANGUAGE = {"EP", "WO"}
+
 
 class Ref:
     """One reference, in the shape the IDS tables want."""
@@ -91,6 +98,10 @@ class Ref:
             return "%s %s" % (self.country, self.number)
         return self.number
 
+    def translation_checked(self):
+        return (self.table == "foreign"
+                and self.country not in ENGLISH_OFFICES | EITHER_LANGUAGE)
+
 
 def refs_from_folder(folder):
     """Every PDF in a folder, read as 'the file name is the number'."""
@@ -100,6 +111,10 @@ def refs_from_folder(folder):
             continue
         stem = os.path.splitext(name)[0]
         stem = re.sub(r"[_\-]+", " ", stem)
+        m = re.match(r"\W*((?!US)[A-Z]{2}\s*\d[\d ,/]{4,}\d(?:\s*[A-Z]\d?(?![A-Za-z]))?)", stem, re.I)   # a foreign number, whatever its length
+        if m:
+            out.append(Ref(m.group(1)))
+            continue
         m = re.search(r"((?:US|EP|WO|GB|DE|FR|JP|CN|KR|CA|IL)?\s*"
                       r"(?:20\d{2}[/\-\s]?\d{6,7}|[0-9]{1,2},?[0-9]{3},?[0-9]{3})"
                       r"(?:\s*[A-Z]\d?(?![A-Za-z]))?)", stem, re.I)     # a kind code is a lone letter, not the "s" of "see"
@@ -265,7 +280,7 @@ HEAD = [("us_patent", "U.S. PATENTS",
         ("us_pub", "U.S. PATENT APPLICATION PUBLICATIONS",
          ["Cite No.", "Publication Number", "Kind Code", "Publication Date", "Name of Applicant"]),
         ("foreign", "FOREIGN PATENT DOCUMENTS",
-         ["Cite No.", "Country", "Number", "Kind Code", "Date", "Name of Applicant"]),
+         ["Cite No.", "Country", "Number", "Kind Code", "Date", "Name of Applicant", "T"]),
         ("npl", "NON-PATENT LITERATURE DOCUMENTS",
          ["Cite No.", "Document"])]
 
@@ -273,7 +288,7 @@ HEAD = [("us_patent", "U.S. PATENTS",
 # enough for their headings; the number and name columns take the rest.
 WIDTHS = {"us_patent": [0.8, 1.9, 0.95, 1.0, 1.85],
           "us_pub":    [0.8, 1.9, 0.95, 1.0, 1.85],
-          "foreign":   [0.8, 0.8, 1.4, 0.95, 1.0, 1.55],
+          "foreign":   [0.8, 0.8, 1.25, 0.95, 1.0, 1.35, 0.35],
           "npl":       [0.8, 5.7]}
 
 
@@ -304,6 +319,22 @@ def _underline_cell(cell):
         bottom.set(qn(k), v)
     borders.append(bottom)
     tcPr.append(borders)
+
+
+def _checkbox(paragraph, checked):
+    """A Word checkbox control: one click checks or clears it."""
+    from docx.oxml import parse_xml
+    glyph, val = ("\u2612", "1") if checked else ("\u2610", "0")
+    paragraph._p.append(parse_xml(
+        '<w:sdt xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+        'xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml"><w:sdtPr>'
+        '<w:alias w:val="English-language translation provided"/>'
+        '<w14:checkbox><w14:checked w14:val="%s"/>'
+        '<w14:checkedState w14:val="2612" w14:font="Segoe UI Symbol"/>'
+        '<w14:uncheckedState w14:val="2610" w14:font="Segoe UI Symbol"/></w14:checkbox>'
+        '</w:sdtPr><w:sdtContent><w:r><w:rPr>'
+        '<w:rFonts w:ascii="Segoe UI Symbol" w:hAnsi="Segoe UI Symbol" w:eastAsia="Segoe UI Symbol" '
+        'w:cs="Segoe UI Symbol"/></w:rPr><w:t>%s</w:t></w:r></w:sdtContent></w:sdt>' % (val, glyph)))
 
 
 def write_docx(refs, path, applicant="", app_no="", filed="", title="",
@@ -378,7 +409,13 @@ def write_docx(refs, path, applicant="", app_no="", filed="", title="",
                 vals = [str(n), ref.display_number(), ref.kind, ref.dated, ref.inventor]
             for i, v in enumerate(vals):
                 cells[i].text = v or ""
+            if key == "foreign":
+                cells[-1].paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
+                _checkbox(cells[-1].paragraphs[0], ref.translation_checked())
         _set_widths(t, WIDTHS[key])
+        if key == "foreign":
+            doc.add_paragraph("T: a checked box means an English-language translation "
+                              "is provided with the reference.")
         doc.add_paragraph()
 
     doc.add_paragraph(
@@ -412,9 +449,10 @@ def write_docx(refs, path, applicant="", app_no="", filed="", title="",
 def write_csv(refs, path):
     with open(path, "w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["table", "number", "kind", "filing date", "date", "first inventor", "title", "note"])
+        w.writerow(["table", "number", "kind", "filing date", "date", "first inventor", "title", "note", "T"])
         for r in refs:
-            w.writerow([r.table, r.display_number(), r.kind, r.filed, r.dated, r.inventor, r.title, r.note])
+            w.writerow([r.table, r.display_number(), r.kind, r.filed, r.dated, r.inventor, r.title, r.note,
+                        "yes" if r.translation_checked() else ""])
 
 
 # --------------------------------------------------------------------------- #
@@ -487,6 +525,14 @@ def main(argv=None):
     missing = [r for r in unique if r.note]
     if missing:
         print("\nCheck by hand: %s" % ", ".join(r.display_number() for r in missing))
+    checked = [r for r in unique if r.translation_checked()]
+    if checked:
+        print("\nT box checked, so provide a translation or clear the box: %s"
+              % ", ".join(r.display_number() for r in checked))
+    either = [r for r in unique if r.table == "foreign" and r.country in EITHER_LANGUAGE]
+    if either:
+        print("\nT box left clear, check the language: %s"
+              % ", ".join(r.display_number() for r in either))
     return 0
 
 

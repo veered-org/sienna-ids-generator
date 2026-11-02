@@ -66,6 +66,24 @@ class Document(unittest.TestCase):
             self.assertEqual((rows["Name:"], rows["Registration No.:"]), ("Jane Roe", "12,345"))
             self.assertEqual(rows["Date:"], ids_gen.signature_date())
 
+    def test_t_box_on_foreign_rows_only(self):
+        refs = [ids_gen.Ref(x) for x in ("10000000", "CN110123456A", "JP2015123456A", "GB2345678A",
+                                         "EP1234567A1", "WO2019123456A1")]
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "IDS.docx")
+            ids_gen.write_docx(refs, out)
+            from docx import Document as Docx
+            doc = Docx(out)
+            us, foreign = doc.tables[2], doc.tables[3]
+            self.assertNotEqual(us.rows[0].cells[-1].text, "T")
+            self.assertEqual(foreign.rows[0].cells[-1].text, "T")
+            boxes = {}
+            for row in foreign.rows[1:]:
+                val = [e.get("{http://schemas.microsoft.com/office/word/2010/wordml}val")
+                       for e in row.cells[-1]._tc.iter("{http://schemas.microsoft.com/office/word/2010/wordml}checked")]
+                boxes[row.cells[1].text] = val
+            self.assertEqual(boxes, {"CN": ["1"], "JP": ["1"], "GB": ["0"], "EP": ["0"], "WO": ["0"]})
+
     def test_csv(self):
         with tempfile.TemporaryDirectory() as d:
             out = os.path.join(d, "refs.csv")
@@ -93,6 +111,16 @@ class FileNames(unittest.TestCase):
                 open(os.path.join(d, n), "w").close()
             got = {r.number: r.kind for r in ids_gen.refs_from_folder(d)}
             self.assertEqual(got, {"5518486": "", "6152311": "A", "10000000": "B2", "11395437": ""})
+
+
+    def test_foreign_numbers_keep_their_country_and_every_digit(self):
+        with tempfile.TemporaryDirectory() as d:
+            for n in ("CN110123456A.pdf", "DE102015123456A1.pdf", "KR101234567B1 widget.pdf", "TW1234567B.pdf",
+                      "JP2015-123456.pdf", "WO2019123456A1.pdf", "US 9,876,543.pdf", "see 5518486.pdf"):
+                open(os.path.join(d, n), "w").close()
+            got = {r.display_number() for r in ids_gen.refs_from_folder(d)}
+            self.assertEqual(got, {"CN 110123456", "DE 102015123456", "KR 101234567", "TW 1234567",
+                                   "JP 2015123456", "WO 2019123456", "9,876,543", "5,518,486"})
 
 
 class LocalIndex(unittest.TestCase):

@@ -4,7 +4,7 @@
 
 **Runs on** any computer with Python — Windows, Mac or Linux.
 
-**Version 1.0.**
+**Version 1.2.**
 
 Part of [Veered](https://veered.org): free tools, shared as-is. Questions: support@veered.org
 
@@ -34,6 +34,10 @@ could not find.*
 - **It sorts them out.** US patents, US published applications, foreign documents and
   other literature each go to their own table, in number order, numbered 1, 2, 3... in
   one run across all four.
+- **It adds the T column** to the foreign table: a clickable box meaning an English-language
+  translation is provided, as on the SB-1449 and the PTO-892 from November 5, 2026. The box
+  starts checked for foreign documents, and clear for offices that publish in English and
+  for EP and WO, where the language varies. Clear any box with no translation behind it.
 - **It fills in the dates and the inventor** from the published record for each patent,
   and says so plainly when it cannot find one, so nothing is quietly left blank.
 - **It writes a Word document** — headings, the applicant block, the tables and the
